@@ -540,7 +540,7 @@ def create_current_low_level_promo(config, coefs):
         row["Dollars"] = row["Units"] * row["Promo Price"]
         row["Spend"] = row["Fixed Cost"] + row["Units"] * row["Variable Cost per Unit"] + row["Units"] * (row["Base Price"] - row["Promo Price"])
         row["Profit"] = row["Dollars"] - row["Units"] * row["Cost of Goods"] - row["Spend"]
-        row["ROI"] = row["Profit"] / row["Spend"] if row["Spend"] else 0
+        row["ROI"] = row["Profit"] / row["Spend"] if row["Spend"] and row["Profit"] > 0 else 0
         row["Margin"] = (row["Base Price"] - row["Cost of Goods"]) / row["Base Price"] if row["Base Price"] else 0
         rows.append(row)
 
@@ -598,7 +598,7 @@ def aggregate_from_low_rows(agg_key, low_rows, mode, config, matrix):
             row[col] = (group[col] * group["Units"]).sum() / unit_sum if unit_sum and col in group.columns else 0
         row["Margin"] = (row["Base Price"] - row["Cost of Goods"]) / row["Base Price"] if row["Base Price"] else 0
         row["Discount"] = 1 - row["Promo Price"] / row["Base Price"] if row["Base Price"] else 0
-        row["ROI"] = row["Profit"] / row["Spend"] if row["Spend"] else 0
+        row["ROI"] = row["Profit"] / row["Spend"] if row["Spend"] and row["Profit"] > 0 else 0
 
     # Coefficients are preserved for display/debug only. They are not used for aggregated calculations.
     for col in COEF_COLS:
@@ -767,7 +767,7 @@ def recalculate_promo(row, current):
     row["Dollars"] = row["Units"] * row["Promo Price"]
     row["Spend"] = row["Fixed Cost"] + row["Units"] * row["Variable Cost per Unit"] + row["Units"] * (row["Base Price"] - row["Promo Price"])
     row["Profit"] = row["Dollars"] - row["Units"] * row["Cost of Goods"] - row["Spend"]
-    row["ROI"] = row["Profit"] / row["Spend"] if row["Spend"] else 0
+    row["ROI"] = row["Profit"] / row["Spend"] if row["Spend"] and row["Profit"] > 0 else 0
     row["Discount"] = discount
     row["Margin"] = (row["Base Price"] - row["Cost of Goods"]) / row["Base Price"] if row["Base Price"] else 0
     return row
@@ -834,6 +834,69 @@ def safe_ratio(numerator, denominator, default=0.0):
     return float(numerator) / float(denominator)
 
 
+def sync_promo_price_discount_widgets(current_row, simulated_row, key_prefix, is_low_level, editable_cols):
+    """Keep Promo Price and Discount connected in the visible input table.
+
+    This runs before number_input widgets are rendered, so changing either value
+    updates the other on the next Streamlit rerun.
+
+    Rules:
+    - If Discount was changed, Promo Price = Base Price × (1 − Discount).
+    - If Promo Price was changed, Discount = 1 − Promo Price / Base Price.
+    - If Base Price was changed, Discount is recalculated from current Promo Price and Base Price.
+    """
+    if not is_low_level:
+        return
+
+    if "Promo Price" not in editable_cols or "Discount" not in editable_cols:
+        return
+
+    scenario = simulated_row.get("Scenario", "new")
+    config_key = simulated_row.get(KEY_COL, "")
+
+    base_key = f"{key_prefix}_{scenario}_{config_key}_Base Price"
+    promo_key = f"{key_prefix}_{scenario}_{config_key}_Promo Price"
+    discount_key = f"{key_prefix}_{scenario}_{config_key}_Discount"
+
+    base_default = float(simulated_row.get("Base Price", current_row.get("Base Price", 0)) or 0)
+    promo_default = float(simulated_row.get("Promo Price", current_row.get("Promo Price", 0)) or 0)
+    discount_default = 1.0 - safe_ratio(promo_default, base_default, 1.0)
+
+    if base_key not in st.session_state:
+        st.session_state[base_key] = base_default
+    if promo_key not in st.session_state:
+        st.session_state[promo_key] = promo_default
+    if discount_key not in st.session_state:
+        st.session_state[discount_key] = discount_default
+
+    last_base_key = f"__last__{base_key}"
+    last_promo_key = f"__last__{promo_key}"
+    last_discount_key = f"__last__{discount_key}"
+
+    base_val = float(st.session_state.get(base_key, base_default) or 0)
+    promo_val = float(st.session_state.get(promo_key, promo_default) or 0)
+    discount_val = float(st.session_state.get(discount_key, discount_default) or 0)
+
+    last_base = float(st.session_state.get(last_base_key, base_default) or 0)
+    last_promo = float(st.session_state.get(last_promo_key, promo_default) or 0)
+    last_discount = float(st.session_state.get(last_discount_key, discount_default) or 0)
+
+    base_changed = abs(base_val - last_base) > 1e-9
+    promo_changed = abs(promo_val - last_promo) > 1e-9
+    discount_changed = abs(discount_val - last_discount) > 1e-9
+
+    if discount_changed and base_val:
+        promo_val = base_val * (1 - discount_val)
+        st.session_state[promo_key] = promo_val
+    elif (promo_changed or base_changed) and base_val:
+        discount_val = 1.0 - safe_ratio(promo_val, base_val, 1.0)
+        st.session_state[discount_key] = discount_val
+
+    st.session_state[last_base_key] = float(st.session_state.get(base_key, base_val) or 0)
+    st.session_state[last_promo_key] = float(st.session_state.get(promo_key, promo_val) or 0)
+    st.session_state[last_discount_key] = float(st.session_state.get(discount_key, discount_val) or 0)
+
+
 def prepare_price_inputs_for_simulation(edited, current, simulated, mode):
     """Synchronize price inputs before simulation.
 
@@ -844,13 +907,9 @@ def prepare_price_inputs_for_simulation(edited, current, simulated, mode):
     If the Change % next to Base Price is edited:
         Base Price = Current Base Price × (1 + Change %)
 
-    If the Change % next to Promo Price is edited:
-        Promo Price = Current Promo Price × (1 + Change %)
-
-    In Promo Simulator, if the Discount row is edited:
-        Promo Price = Base Price × (1 − Discount)
-
-    Discount takes priority over Promo Price Change % if both are changed.
+    In Promo Simulator:
+    - If Discount is edited, Promo Price = Base Price × (1 − Discount).
+    - If Promo Price is edited, Discount = 1 − Promo Price / Base Price.
     """
     out = dict(edited)
 
@@ -867,17 +926,19 @@ def prepare_price_inputs_for_simulation(edited, current, simulated, mode):
 
         promo_saved = float(simulated.get("Promo Price", current.get("Promo Price", 0)) or 0)
 
-        # Promo Price and Discount are the only editable promo-price controls.
-        # If Discount changed, it drives Promo Price.
-        # Otherwise, Promo Price drives final Discount.
         saved_discount = 1.0 - safe_ratio(promo_saved, base_price, 1.0)
-        edited_discount = out.get("Discount", saved_discount)
-        discount_changed = abs(float(edited_discount) - saved_discount) > 1e-9
+        edited_discount = float(out.get("Discount", saved_discount) or 0)
+        promo_price = float(out.get("Promo Price", promo_saved) or 0)
+
+        # At submit time the visible widgets are already synchronized.
+        # If Discount differs from the saved scenario discount, let it drive Promo Price.
+        # Otherwise, Promo Price drives final Discount.
+        discount_changed = abs(edited_discount - saved_discount) > 1e-9
 
         if discount_changed and base_price:
-            out["Promo Price"] = base_price * (1 - float(edited_discount))
+            promo_price = base_price * (1 - edited_discount)
+            out["Promo Price"] = promo_price
 
-        promo_price = float(out.get("Promo Price", promo_saved) or 0)
         out["Discount"] = 1.0 - safe_ratio(promo_price, base_price, 1.0)
 
     return out
@@ -1039,6 +1100,10 @@ def validate_name(name, exists, replace):
 
 def render_input_table(groups, current_row, simulated_row, editable_cols, is_low_level, key_prefix):
     edited = {}
+
+    # Keep Promo Price and Discount connected before rendering widgets.
+    sync_promo_price_discount_widgets(current_row, simulated_row, key_prefix, is_low_level, editable_cols)
+
     st.markdown('<div class="blue-header">Inputs</div>', unsafe_allow_html=True)
     h1, h2, h3, h4 = st.columns([1.65, 0.9, 0.9, 0.6])
     h1.markdown('<div class="header-cell"></div>', unsafe_allow_html=True)
@@ -1053,9 +1118,16 @@ def render_input_table(groups, current_row, simulated_row, editable_cols, is_low
             cur = current_row.get(col, 0)
             if col == "Discount":
                 cur = 1.0 - safe_ratio(current_row.get("Promo Price", 0), current_row.get("Base Price", 0), 1.0)
-                saved = 1.0 - safe_ratio(simulated_row.get("Promo Price", current_row.get("Promo Price", 0)), simulated_row.get("Base Price", current_row.get("Base Price", 0)), 1.0)
+                widget_key = f"{key_prefix}_{simulated_row.get('Scenario', 'new')}_{simulated_row.get(KEY_COL, '')}_{col}"
+                default_discount = 1.0 - safe_ratio(
+                    simulated_row.get("Promo Price", current_row.get("Promo Price", 0)),
+                    simulated_row.get("Base Price", current_row.get("Base Price", 0)),
+                    1.0,
+                )
+                saved = st.session_state.get(widget_key, default_discount)
             else:
-                saved = simulated_row.get(col, cur)
+                widget_key = f"{key_prefix}_{simulated_row.get('Scenario', 'new')}_{simulated_row.get(KEY_COL, '')}_{col}"
+                saved = st.session_state.get(widget_key, simulated_row.get(col, cur))
             c1, c2, c3, c4 = st.columns([1.65, 0.9, 0.9, 0.6])
             c1.markdown(f'<div class="cell metric-cell">{metric}</div>', unsafe_allow_html=True)
             c2.markdown(f'<div class="cell value-cell">{fmt_value(cur, vtype)}</div>', unsafe_allow_html=True)
