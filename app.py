@@ -149,12 +149,12 @@ TEXT_COLS = [
     *FILTER_COLS,
 ]
 
-BASE_EDITABLE_COLS = ["Base Price", "Base Price Change %", "Cost of Goods", "EDLP Cost per Unit"]
+BASE_EDITABLE_COLS = ["Base Price", "Cost of Goods", "EDLP Cost per Unit"]
 PROMO_EDITABLE_COLS = [
-    "Base Price", "Base Price Change %", "Cost of Goods", "Fixed Cost", "Variable Cost per Unit",
+    "Base Price", "Cost of Goods", "Fixed Cost", "Variable Cost per Unit",
     "Total Weeks", "TPR Weeks", "TPR Promo Support", "Feature Weeks", "Feature Promo Support",
     "Display Weeks", "Display Promo Support", "F&D Weeks", "F&D ACV",
-    "Promo Price", "Promo Price Change %", "Discount",
+    "Promo Price", "Discount",
 ]
 
 PROMO_EXPOSURE_COLS = ["TPR Promo Support", "Feature Promo Support", "Display Promo Support", "F&D ACV"]
@@ -834,67 +834,56 @@ def safe_ratio(numerator, denominator, default=0.0):
     return float(numerator) / float(denominator)
 
 
-def get_input_saved_value(col, current_row, simulated_row):
-    if col == "Base Price Change %":
-        return safe_ratio(
-            simulated_row.get("Base Price", current_row.get("Base Price", 0)),
-            current_row.get("Base Price", 0),
-            1.0,
-        ) - 1.0
-
-    if col == "Promo Price Change %":
-        return safe_ratio(
-            simulated_row.get("Promo Price", current_row.get("Promo Price", 0)),
-            current_row.get("Promo Price", 0),
-            1.0,
-        ) - 1.0
-
-    if col == "Discount":
-        base_price = simulated_row.get("Base Price", current_row.get("Base Price", 0))
-        promo_price = simulated_row.get("Promo Price", current_row.get("Promo Price", 0))
-        return 1.0 - safe_ratio(promo_price, base_price, 1.0)
-
-    return simulated_row.get(col, current_row.get(col, 0))
-
-
 def prepare_price_inputs_for_simulation(edited, current, simulated, mode):
+    """Synchronize price inputs before simulation.
+
+    Price rows have two editable options:
+    - Simulated price value
+    - Change % next to the price
+
+    If the Change % next to Base Price is edited:
+        Base Price = Current Base Price × (1 + Change %)
+
+    If the Change % next to Promo Price is edited:
+        Promo Price = Current Promo Price × (1 + Change %)
+
+    In Promo Simulator, if the Discount row is edited:
+        Promo Price = Base Price × (1 − Discount)
+
+    Discount takes priority over Promo Price Change % if both are changed.
+    """
     out = dict(edited)
 
     base_current = float(current.get("Base Price", 0) or 0)
     base_saved = float(simulated.get("Base Price", base_current) or 0)
-    base_pct_saved = safe_ratio(base_saved, base_current, 1.0) - 1.0
-    base_pct = float(out.get("Base Price Change %", base_pct_saved) or 0)
+    base_change_saved = safe_ratio(base_saved, base_current, 1.0) - 1.0
+    base_change = out.pop("__change_pct__Base Price", base_change_saved)
 
-    if abs(base_pct - base_pct_saved) > 1e-9 and base_current:
-        out["Base Price"] = base_current * (1 + base_pct)
+    if base_change is not None and abs(float(base_change) - base_change_saved) > 1e-9 and base_current:
+        out["Base Price"] = base_current * (1 + float(base_change))
 
     if mode == "promo":
         base_price = float(out.get("Base Price", simulated.get("Base Price", current.get("Base Price", 0))) or 0)
 
         promo_current = float(current.get("Promo Price", 0) or 0)
         promo_saved = float(simulated.get("Promo Price", promo_current) or 0)
-        promo_pct_saved = safe_ratio(promo_saved, promo_current, 1.0) - 1.0
-        discount_saved = 1.0 - safe_ratio(promo_saved, base_price, 1.0)
+        promo_change_saved = safe_ratio(promo_saved, promo_current, 1.0) - 1.0
+        promo_change = out.pop("__change_pct__Promo Price", promo_change_saved)
 
-        promo_pct = float(out.get("Promo Price Change %", promo_pct_saved) or 0)
-        discount = float(out.get("Discount", discount_saved) or 0)
-
-        discount_changed = abs(discount - discount_saved) > 1e-9
-        promo_pct_changed = abs(promo_pct - promo_pct_saved) > 1e-9
+        saved_discount = 1.0 - safe_ratio(promo_saved, base_price, 1.0)
+        edited_discount = out.get("Discount", saved_discount)
+        discount_changed = abs(float(edited_discount) - saved_discount) > 1e-9
+        promo_change_changed = promo_change is not None and abs(float(promo_change) - promo_change_saved) > 1e-9
 
         if discount_changed and base_price:
-            out["Promo Price"] = base_price * (1 - discount)
-        elif promo_pct_changed and promo_current:
-            out["Promo Price"] = promo_current * (1 + promo_pct)
+            out["Promo Price"] = base_price * (1 - float(edited_discount))
+        elif promo_change_changed and promo_current:
+            out["Promo Price"] = promo_current * (1 + float(promo_change))
 
         promo_price = float(out.get("Promo Price", promo_saved) or 0)
         out["Discount"] = 1.0 - safe_ratio(promo_price, base_price, 1.0)
 
-    out.pop("Base Price Change %", None)
-    out.pop("Promo Price Change %", None)
-
     return out
-
 
 def get_logo_html():
     # Use text logo instead of image file so there is no white background box.
@@ -1065,11 +1054,11 @@ def render_input_table(groups, current_row, simulated_row, editable_cols, is_low
         for r in rows:
             col, metric, vtype, step = r["col"], r["metric"], r.get("type", "number"), r.get("step", 0.01)
             cur = current_row.get(col, 0)
-            if col in ["Base Price Change %", "Promo Price Change %"]:
-                cur = 0.0
             if col == "Discount":
                 cur = 1.0 - safe_ratio(current_row.get("Promo Price", 0), current_row.get("Base Price", 0), 1.0)
-            saved = get_input_saved_value(col, current_row, simulated_row)
+                saved = 1.0 - safe_ratio(simulated_row.get("Promo Price", current_row.get("Promo Price", 0)), simulated_row.get("Base Price", current_row.get("Base Price", 0)), 1.0)
+            else:
+                saved = simulated_row.get(col, cur)
             c1, c2, c3, c4 = st.columns([1.65, 0.9, 0.9, 0.6])
             c1.markdown(f'<div class="cell metric-cell">{metric}</div>', unsafe_allow_html=True)
             c2.markdown(f'<div class="cell value-cell">{fmt_value(cur, vtype)}</div>', unsafe_allow_html=True)
@@ -1090,7 +1079,20 @@ def render_input_table(groups, current_row, simulated_row, editable_cols, is_low
                 edited[col] = saved
                 sim_for_change = saved
 
-            c4.markdown(f'<div class="cell change-cell">{fmt_change(calc_change(cur, sim_for_change))}</div>', unsafe_allow_html=True)
+            # For price rows, Change % is editable and can drive price recalculation.
+            if is_low_level and col in ["Base Price", "Promo Price"]:
+                change_key = f"{key_prefix}_{simulated_row.get('Scenario', 'new')}_{simulated_row.get(KEY_COL, '')}_{col}_change_pct"
+                change_label = f"{key_prefix}_{col}_change_pct"
+                saved_change = calc_change(cur, saved)
+                edited[f"__change_pct__{col}"] = c4.number_input(
+                    label=change_label,
+                    value=float(saved_change),
+                    step=0.01,
+                    label_visibility="collapsed",
+                    key=change_key,
+                )
+            else:
+                c4.markdown(f'<div class="cell change-cell">{fmt_change(calc_change(cur, sim_for_change))}</div>', unsafe_allow_html=True)
     return edited
 
 
@@ -1181,10 +1183,7 @@ def render_simulator_page(mode, config, matrix, coefs):
 
         if mode == "base":
             groups = [
-                ("Price", [
-                    {"metric": "Base Price", "col": "Base Price", "type": "currency", "step": 0.01},
-                    {"metric": "Base Price Change %", "col": "Base Price Change %", "type": "percent", "step": 0.01},
-                ]),
+                ("Price", [{"metric": "Base Price", "col": "Base Price", "type": "currency", "step": 0.01}]),
                 ("Financials", [{"metric": "Cost of Goods", "col": "Cost of Goods", "type": "currency", "step": 0.01},
                                 {"metric": "Margin", "col": "Margin", "type": "percent"}]),
                 ("Costs", [{"metric": "EDLP Cost per Unit", "col": "EDLP Cost per Unit", "type": "currency", "step": 0.01}]),
@@ -1194,10 +1193,7 @@ def render_simulator_page(mode, config, matrix, coefs):
             currency_metrics = ["Dollars", "Cost", "Profit"]
         else:
             groups = [
-                ("Price", [
-                    {"metric": "Base Price", "col": "Base Price", "type": "currency", "step": 0.01},
-                    {"metric": "Base Price Change %", "col": "Base Price Change %", "type": "percent", "step": 0.01},
-                ]),
+                ("Price", [{"metric": "Base Price", "col": "Base Price", "type": "currency", "step": 0.01}]),
                 ("Financials", [{"metric": "Cost of Goods", "col": "Cost of Goods", "type": "currency", "step": 0.01},
                                 {"metric": "Margin", "col": "Margin", "type": "percent"}]),
                 ("Promo Costs", [{"metric": "Fixed Cost", "col": "Fixed Cost", "type": "currency0", "step": 100.0},
@@ -1212,7 +1208,6 @@ def render_simulator_page(mode, config, matrix, coefs):
                                {"metric": "F&D Weeks", "col": "F&D Weeks", "type": "weeks", "step": 0.1},
                                {"metric": "F&D ACV", "col": "F&D ACV", "type": "percent", "step": 0.01},
                                {"metric": "Promo Price", "col": "Promo Price", "type": "currency", "step": 0.01},
-                               {"metric": "Promo Price Change %", "col": "Promo Price Change %", "type": "percent", "step": 0.01},
                                {"metric": "Discount", "col": "Discount", "type": "percent", "step": 0.01}]),
             ]
             editable_cols = PROMO_EDITABLE_COLS
@@ -1241,6 +1236,9 @@ def render_simulator_page(mode, config, matrix, coefs):
                 st.error("This is an aggregated level. Simulation changes can only be applied at low-level PPG.")
                 st.stop()
             edited_values = {col: edited[col] for col in editable_cols if col in edited}
+            for change_key in ["__change_pct__Base Price", "__change_pct__Promo Price"]:
+                if change_key in edited:
+                    edited_values[change_key] = edited[change_key]
             edited_values = prepare_price_inputs_for_simulation(edited_values, current, simulated, mode)
             df = apply_low_level_simulation(df, name, selected_key, edited_values, mode, config, matrix, coefs)
             st.session_state[state_key] = df
