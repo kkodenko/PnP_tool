@@ -865,20 +865,17 @@ def prepare_price_inputs_for_simulation(edited, current, simulated, mode):
     if mode == "promo":
         base_price = float(out.get("Base Price", simulated.get("Base Price", current.get("Base Price", 0))) or 0)
 
-        promo_current = float(current.get("Promo Price", 0) or 0)
-        promo_saved = float(simulated.get("Promo Price", promo_current) or 0)
-        promo_change_saved = safe_ratio(promo_saved, promo_current, 1.0) - 1.0
-        promo_change = out.pop("__change_pct__Promo Price", promo_change_saved)
+        promo_saved = float(simulated.get("Promo Price", current.get("Promo Price", 0)) or 0)
 
+        # Promo Price and Discount are the only editable promo-price controls.
+        # If Discount changed, it drives Promo Price.
+        # Otherwise, Promo Price drives final Discount.
         saved_discount = 1.0 - safe_ratio(promo_saved, base_price, 1.0)
         edited_discount = out.get("Discount", saved_discount)
         discount_changed = abs(float(edited_discount) - saved_discount) > 1e-9
-        promo_change_changed = promo_change is not None and abs(float(promo_change) - promo_change_saved) > 1e-9
 
         if discount_changed and base_price:
             out["Promo Price"] = base_price * (1 - float(edited_discount))
-        elif promo_change_changed and promo_current:
-            out["Promo Price"] = promo_current * (1 + float(promo_change))
 
         promo_price = float(out.get("Promo Price", promo_saved) or 0)
         out["Discount"] = 1.0 - safe_ratio(promo_price, base_price, 1.0)
@@ -1080,7 +1077,7 @@ def render_input_table(groups, current_row, simulated_row, editable_cols, is_low
                 sim_for_change = saved
 
             # For price rows, Change % is editable and can drive price recalculation.
-            if is_low_level and col in ["Base Price", "Promo Price"]:
+            if is_low_level and col == "Base Price":
                 change_key = f"{key_prefix}_{simulated_row.get('Scenario', 'new')}_{simulated_row.get(KEY_COL, '')}_{col}_change_pct"
                 change_label = f"{key_prefix}_{col}_change_pct"
                 saved_change = calc_change(cur, saved)
@@ -1236,9 +1233,8 @@ def render_simulator_page(mode, config, matrix, coefs):
                 st.error("This is an aggregated level. Simulation changes can only be applied at low-level PPG.")
                 st.stop()
             edited_values = {col: edited[col] for col in editable_cols if col in edited}
-            for change_key in ["__change_pct__Base Price", "__change_pct__Promo Price"]:
-                if change_key in edited:
-                    edited_values[change_key] = edited[change_key]
+            if "__change_pct__Base Price" in edited:
+                edited_values["__change_pct__Base Price"] = edited["__change_pct__Base Price"]
             edited_values = prepare_price_inputs_for_simulation(edited_values, current, simulated, mode)
             df = apply_low_level_simulation(df, name, selected_key, edited_values, mode, config, matrix, coefs)
             st.session_state[state_key] = df
